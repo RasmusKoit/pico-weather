@@ -1,16 +1,16 @@
 from time import sleep, sleep_ms, localtime
-from machine import Pin, SoftI2C, RTC, ADC, mem32
-from ssd1306 import SSD1306_I2C
+from machine import Pin, SoftI2C, RTC, ADC, mem32, lightsleep
+from ssd1306 import SSD1306_I2C  # type: ignore
 from NETINFO import WIFI_SSID, WIFI_PASSWORD, WEATHER_API_URL, TIME_API_URL
-import network
-import urequests
-import dht
+import network  # type: ignore
+import urequests  # type: ignore
+import dht  # type: ignore
 
 # Pins
 LED_PIN = Pin("LED", Pin.OUT)
-SCL_PIN = Pin(19)
-SDA_PIN = Pin(18)
-DHT22_PIN = Pin(27)
+SCL_PIN = Pin(17)
+SDA_PIN = Pin(16)
+DHT22_PIN = Pin(21)
 CS_PIN = Pin(25, Pin.OUT)
 VSYS_PIN = Pin(29)
 
@@ -34,10 +34,12 @@ def init():
     init_display(True, False, False)
     rtc.datetime(get_time())
     init_display(True, True, False)
-    run_program()
+    run_scenes()
 
 
-def init_display(wifi_status: bool = False, time_status: bool = False, sensor_status: bool = False):
+def init_display(
+    wifi_status: bool = False, time_status: bool = False, sensor_status: bool = False
+):
     """Initialize and display startup information."""
     display.fill(0)
     display.text("Pico Weather", 0, 5)
@@ -47,47 +49,61 @@ def init_display(wifi_status: bool = False, time_status: bool = False, sensor_st
     display.text("Time:    " + ("OK" if time_status else "..."), 0, 40)
     display.text("Sensors: " + ("OK" if sensor_status else "..."), 0, 50)
     display.show()
-    
 
 
 def wifi_action(activate: bool) -> None:
     """Manage the WiFi connection."""
     if activate:
-        wifi.active(True)
-        wifi.connect(WIFI_SSID, WIFI_PASSWORD)
-        timeout = 60
-        while not wifi.isconnected() and timeout > 0:
-            sleep(1)
-            timeout -= 1
-            print("Connecting to WiFi...")
-        if wifi.isconnected():
-            print("Connected to WiFi")
+        # Check if WiFi is already active and connected
+        if wifi.active() and wifi.isconnected():
+            print("WiFi already active and connected")
+            return
+
+        if not wifi.active():
+            print("Activating WiFi")
+            wifi.active(True)
+
+        # Check if WiFi is connected, if not, attempt to connect
+        if not wifi.isconnected():
+            wifi.connect(WIFI_SSID, WIFI_PASSWORD)
+            timeout = 30  # Reduced timeout to 30 seconds
+            while not wifi.isconnected() and timeout > 0:
+                sleep(1)
+                timeout -= 1
+                print("Connecting to WiFi...")
+            if wifi.isconnected():
+                print("Connected to WiFi")
+            else:
+                print("Failed to connect to WiFi within 30 seconds")
         else:
-            print("Failed to connect to WiFi within 60 seconds")
+            print("WiFi is already connected")
     else:
-        wifi.active(False)
-        print("WiFi deactivated")
+        if wifi.active():
+            wifi.active(False)
+            wifi.deinit()
+            print("WiFi deactivated")
+        else:
+            print("WiFi is already deactivated")
 
 
-def query_outside() -> tuple:
+def query_outside() -> list:
     """Query external weather data."""
+
     try:
         headers = {
             "User-Agent": "Pico Weather/1.0 github.com/rasmuskoit",
             "Accept": "application/json",
         }
+        # Make sure wifi is active
+        wifi_action(True)
         response = urequests.get(WEATHER_API_URL, headers=headers)
+        # turn off wifi
         data = response.json()
-        air_temperature = data["properties"]["timeseries"][0]["data"]["instant"][
-            "details"
-        ]["air_temperature"]
-        moisture = data["properties"]["timeseries"][0]["data"]["instant"]["details"][
-            "relative_humidity"
-        ]
-        return air_temperature, moisture
+        wifi_action(False)
+        return data["properties"]["timeseries"][0:3]
     except Exception as e:
         print(f"Failed to get outside values: {e}")
-        return 0, 0
+        return []
 
 
 def get_time() -> tuple:
@@ -170,61 +186,152 @@ def draw_custom_char():
         display.pixel(x, y, 1)
 
 
-def run_program():
-    """Main program loop."""
+def read_dht22():
+    # Read the DHT22 sensor values, try 3 times
+    attempt = 0
+    while attempt < 3:
+        try:
+            sensor_dht22.measure()
+            # If sensor values are read successfully, break the loop
+            home_humidity = sensor_dht22.humidity()
+            home_temperature = sensor_dht22.temperature()
+            # if temp is 0, retry
+            if home_temperature != 0 and home_humidity != 0:
+                break
+            sleep(2)
+            attempt += 1
+        except OSError:
+            print("Failed to read DHT22 sensor values")
+            return 0, 0
+    return home_temperature, home_humidity
+def run_scenes():
+    """Run the scenes."""
     try:
+        scene = 0
+        number_of_scenes = 2
+        scene_duration = 15
         current_time_by_minute = rtc.datetime()[4] * 60 + rtc.datetime()[5]
-        sensor_dht22.measure()
-        home_humidity = sensor_dht22.humidity()
-        home_temperature = sensor_dht22.temperature()
-        out_temperature, out_humidity = query_outside()
+        data = query_outside()
+        home_temperature, home_humidity = read_dht22()
         init_display(True, True, True)
         sleep(2)
         while True:
-            if (
-                rtc.datetime()[4] * 60 + rtc.datetime()[5] - current_time_by_minute
-                >= 35
-            ):
+            # Read the DHT22 sensor values
+            home_temperature, home_humidity = read_dht22()
+            # Calculate the current time in minutes
+            current_time_minutes = rtc.datetime()[4] * 60 + rtc.datetime()[5]
+
+            if current_time_minutes - current_time_by_minute >= 30:
                 try:
                     print("Querying new outside values")
-                    print(f"Current time: {rtc.datetime()}")
-                    print(f"Current values: {home_temperature}, {home_humidity}")
-                    out_temperature, out_humidity = query_outside()
-                    print(f"New values: {out_temperature}, {out_humidity}")
-                    current_time_by_minute = rtc.datetime()[4] * 60 + rtc.datetime()[5]
+                    data = query_outside()
+                    current_time_by_minute = current_time_minutes
                 except MemoryError:
-                    print("Memory allocation failed. Please try again later.")
-            else:
-                print(
-                    f"Current time: {rtc.datetime()[4] * 60 + rtc.datetime()[5] - current_time_by_minute}"
-                )
-
-            sensor_dht22.measure()
-            home_humidity = sensor_dht22.humidity()
-            home_temperature = sensor_dht22.temperature()
-            date_formatted = "{:02d}.{:02d}.{:02d} {:02d}:{:02d}".format(
-                rtc.datetime()[2],
-                rtc.datetime()[1],
-                rtc.datetime()[0] % 100,
-                rtc.datetime()[4],
-                rtc.datetime()[5],
-            )
-
+                    print("Memory allocation failed. Please try again later")
+                except Exception as e:
+                    print(f"Failed to get outside values: {e}")
             display.fill(0)
-            display.text(date_formatted, int((128 - len(date_formatted) * 8) / 2), 0)
-            display.text(f"Kodus {home_temperature:.1f} C", 0, 20)
-            display.text(f"      {home_humidity:.1f} %", 0, 32)
-            draw_custom_char()
-            display.text(f"Oues  {out_temperature:.1f} C", 0, 44)
-            display.text(f"      {out_humidity:.1f} %", 0, 56)
-            draw_battery()
+            if scene == 0:
+                outside_temperature = data[0]["data"]["instant"]["details"][
+                    "air_temperature"
+                ]
+                outside_humidity = data[0]["data"]["instant"]["details"][
+                    "relative_humidity"
+                ]
+                current_weather(
+                    home_temperature,
+                    home_humidity,
+                    outside_temperature,
+                    outside_humidity,
+                )
+            elif scene == 1:
+                forecast_weather(data)
+            else:
+                scene = 0
+            scene = (scene + 1) % number_of_scenes
             display.show()
-            sleep(5)
+            # Try to light sleep to save power
+            lightsleep(scene_duration * 1000)
+            # sleep(scene_duration)
     except KeyboardInterrupt:
         print("Program stopped by user")
         wifi_action(False)
     except Exception as e:
+        display.fill(0)
+        display.text("Error occurred", 0, 5)
+        display.text(str(e), 0, 20)
         print(f"Error occurred: {e}")
+
+
+def get_timezone_offset(date_str) -> int:
+    pico_hour = rtc.datetime()[4]
+    date_hour = int(date_str[11:13])
+    return pico_hour - date_hour
+
+
+def current_weather(h_temp, h_hum, o_temp, o_hum):
+    """Display the current weather."""
+    # Display current weather
+    date_formatted = "{:02d}.{:02d}.{:02d} {:02d}:{:02d}".format(
+        rtc.datetime()[2],
+        rtc.datetime()[1],
+        rtc.datetime()[0] % 100,
+        rtc.datetime()[4],
+        rtc.datetime()[5],
+    )
+    display.text(date_formatted, int((128 - len(date_formatted) * 8) / 2), 0)
+    display.hline(0, 14, 128, 1)
+    display.text(f"Kodus {h_temp:.1f} C", 0, 20)
+    display.text(f"      {h_hum:.1f} %", 0, 32)
+    draw_custom_char()
+    display.text(f"Oues  {o_temp:.1f} C", 0, 44)
+    display.text(f"      {o_hum:.1f} %", 0, 56)
+    draw_battery()
+
+
+def get_datetime_hour(date_str: str, offset: int) -> str:
+    # handle the case when number is larger than 24
+    # handle the case when number is smaller than 0
+    hour = int(date_str[11:13]) + offset
+    if hour > 24:
+        hour -= 24
+    elif hour < 0:
+        hour += 24
+    # return the hour, add leading zero if needed
+    return f"{hour:02d}"
+
+
+def forecast_weather(weather_data: list):
+    """Display the forecast weather."""
+    tz_offset = get_timezone_offset(weather_data[0]["time"])
+    title = "Ilmaprognoos"
+    display.text(title, int((128 - len(title) * 8) / 2), 0)
+    display.hline(0, 14, 128, 1)
+    display.vline(0, 16, 48, 1)
+    display.vline(42, 16, 48, 1)
+    display.vline(84, 16, 48, 1)
+    display.vline(127, 16, 48, 1)
+    display.hline(0, 28, 128, 1)
+    # Display hours and weather data
+    for i in range(len(weather_data)):
+        display.text(
+            f"{get_datetime_hour(weather_data[i]['time'], tz_offset) }", i * 42 + 16, 18
+        )
+        display.text(
+            f"{weather_data[i]['data']['instant']['details']['air_temperature']:.0f}C",
+            i * 42 + 12,
+            30,
+        )
+        display.text(
+            f"{weather_data[i]['data']['instant']['details']['relative_humidity']:.0f}%",
+            i * 42 + 12,
+            42,
+        )
+        display.text(
+            f"{weather_data[i]['data']['next_1_hours']['details']['precipitation_amount']:02.0f}mm",
+            i * 42 + 5,
+            54,
+        )
 
 
 # Start the program
